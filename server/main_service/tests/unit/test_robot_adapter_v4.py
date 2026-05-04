@@ -20,8 +20,8 @@ sys.modules["nav2_msgs.action"]           = MagicMock()
 sys.modules["pymycobot"]                  = MagicMock()
 sys.modules["pymycobot.mycobot280"]       = MagicMock()
 
-import main_service.robot_adapter_v4 as mod
-from main_service.robot_adapter_v4 import (
+import main_service.management.services.adapters.robot_adapter_v4 as mod
+from main_service.management.services.adapters.robot_adapter_v4 import (
     # 테이블
     DOCK_STATIONS,
     MANUFACTURING_WAYPOINTS,
@@ -59,7 +59,7 @@ def mc() -> MagicMock:
 
 @pytest.fixture(autouse=True)   # ← 여기 추가
 def no_sleep(monkeypatch):
-    monkeypatch.setattr("main_service.robot_adapter_v4.time.sleep", lambda _: None)
+    monkeypatch.setattr("main_service.management.services.adapters.robot_adapter_v4.time.sleep", lambda _: None)
 # =============================================================================
 # 3️⃣  Pydantic Input 모델 — 유효성 검증
 # =============================================================================

@@ -1,6 +1,6 @@
 """Pydantic Models 정의 (Interface Contracts Guide 기준)."""
 from typing import Optional, List
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .enums import EventType, EquipTaskType, TransTaskType, EquipStat, TransStat, OrdStat, TxnStat
 
@@ -79,3 +79,47 @@ class StartProductionBatchAckModel(BaseModel):
     rejected_count: int
     orders: List[StartProductionOrderAckModel] = []
     message: Optional[str] = None
+
+
+class SendCommandResult(BaseModel):
+    """send_command() 단일 동작 실행 결과."""
+    succeeded: bool
+    message:   str
+
+
+class GripperInput(BaseModel):
+    """GRIPPER_OPEN / GRIPPER_CLOSE payload."""
+    speed: int   = Field(50,  ge=1,  le=100)
+    delay: float = Field(1.0, ge=0.0)
+
+
+class GoHomeInput(BaseModel):
+    """GO_HOME payload."""
+    speed: int   = Field(50,  ge=1,  le=100)
+    delay: float = Field(1.0, ge=0.0)
+
+
+class MoveZRelInput(BaseModel):
+    """MOVE_Z_REL payload."""
+    delta_z: float
+    speed:   int   = Field(30,  ge=1,  le=100)
+    delay:   float = Field(2.0, ge=0.0)
+
+
+class ManufacturingWaypointInput(BaseModel):
+    """MAT manufacturing waypoint payload."""
+    speed: int   = Field(50,  ge=1,  le=100)
+    delay: float = Field(3.0, ge=0.0)
+
+
+class PutawayWaypointInput(BaseModel):
+    """PAT putaway waypoint payload (PICK 제외)."""
+    floor: int   = Field(...,  ge=1,  le=3)
+    cell:  int   = Field(...,  ge=1,  le=6)
+    speed: int   = Field(30,  ge=1,  le=100)
+    delay: float = Field(3.0, ge=0.0)
+
+
+class PutawayPickInput(BaseModel):
+    """PAT putaway PICK payload."""
+    speed: int = Field(50, ge=1, le=100)

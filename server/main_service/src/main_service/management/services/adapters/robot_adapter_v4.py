@@ -28,6 +28,8 @@ from rclpy.node import Node
 
 from pymycobot.mycobot280 import MyCobot280
 
+from ..core.contracts.models import *
+
 # ---------------------------------------------------------------------------
 # 로봇 역할 검증 테이블
 # ---------------------------------------------------------------------------
@@ -181,57 +183,6 @@ PICK_PRE_ANGLES:    Tuple[float, ...] = (90.00,   0.00,   0.00,  0.00, 0.00, 45.
 PICK_TARGET_ANGLES: Tuple[float, ...] = (90.00, -20.39, -36.56, -7.99, 0.00, 45.00)
 
 
-# ---------------------------------------------------------------------------
-# Pydantic 모델
-# ---------------------------------------------------------------------------
-
-# ── Result ──────────────────────────────────────────────────────────────────
-
-class SendCommandResult(BaseModel):
-    """send_command() 단일 동작 실행 결과."""
-    succeeded: bool
-    message:   str
-
-
-# ── Input ───────────────────────────────────────────────────────────────────
-
-class GripperInput(BaseModel):
-    """GRIPPER_OPEN / GRIPPER_CLOSE payload."""
-    speed: int   = Field(50,  ge=1,  le=100)
-    delay: float = Field(1.0, ge=0.0)
-
-
-class GoHomeInput(BaseModel):
-    """GO_HOME payload."""
-    speed: int   = Field(50,  ge=1,  le=100)
-    delay: float = Field(1.0, ge=0.0)
-
-
-class MoveZRelInput(BaseModel):
-    """MOVE_Z_REL payload."""
-    delta_z: float
-    speed:   int   = Field(30,  ge=1,  le=100)
-    delay:   float = Field(2.0, ge=0.0)
-
-
-class ManufacturingWaypointInput(BaseModel):
-    """MAT manufacturing waypoint payload."""
-    speed: int   = Field(50,  ge=1,  le=100)
-    delay: float = Field(3.0, ge=0.0)
-
-
-class PutawayWaypointInput(BaseModel):
-    """PAT putaway waypoint payload (PICK 제외)."""
-    floor: int   = Field(...,  ge=1,  le=3)
-    cell:  int   = Field(...,  ge=1,  le=6)
-    speed: int   = Field(30,  ge=1,  le=100)
-    delay: float = Field(3.0, ge=0.0)
-
-
-class PutawayPickInput(BaseModel):
-    """PAT putaway PICK payload."""
-    speed: int = Field(50, ge=1, le=100)
-
 
 # ---------------------------------------------------------------------------
 # Adapter
@@ -300,7 +251,7 @@ class Adapter:
             return self._handle_ra(robot_id, task_type, payload)
 
         return SendCommandResult(succeeded=False, message=f"unknown robot_id: {robot_id}")
-
+    
     # -------------------------------------------------------------------
     # AMR: ROS2 DockRobot action
     # -------------------------------------------------------------------
