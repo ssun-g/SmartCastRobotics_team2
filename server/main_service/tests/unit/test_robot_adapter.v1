@@ -1,0 +1,164 @@
+"""adapter_v1.send_task 단위 테스트.
+
+검증 대상: services/control/adapter_v2.py
+계약:
+- Input: robot_id, task_type, payload (모두 필수)
+- Output: AMRGoalPose | ArmGoalPose (좌표 매핑은 Adapter 내부 테이블 조회)
+- robot_id prefix 로 로봇 종류 분기 ("AMR-*" / "ARM-*")
+- ARM 은 robot_id 별로 좌표 테이블이 다름
+
+실행:
+    cd backend/management
+    pytest tests/test_adapter_v2.py -v
+"""
+import dataclasses
+
+import pytest
+
+from main_service.robot_adapter_v2 import (
+    AMRGoalPose,
+    ArmGoalPose,
+    send_task,
+)
+
+
+# ===========================================================================
+# 1. 타입 분기 — robot_id prefix 로 올바른 GoalPose 종류가 반환되는가
+# ===========================================================================
+
+class TestTypeDispatch:
+    def test_amr_prefix_returns_amr_goal_pose(self):
+        """AMR-* prefix → AMRGoalPose 인스턴스를 반환해야 한다."""
+        result = send_task("AMR-001", "MV_SRC", {})
+        assert isinstance(result, AMRGoalPose)
+
+    def test_arm_prefix_returns_arm_goal_pose(self):
+        """ARM-* prefix → ArmGoalPose 인스턴스를 반환해야 한다."""
+        result = send_task("ARM-001", "MM", {})
+        assert isinstance(result, ArmGoalPose)
+
+    def test_lowercase_prefix_is_normalized(self):
+        """prefix 비교는 대소문자 무시 — 'amr-002' 도 정상 처리."""
+        result = send_task("amr-002", "MV_SRC", {})
+        assert isinstance(result, AMRGoalPose)
+
+    def test_unsupported_prefix_raises(self):
+        """등록되지 않은 prefix 는 ValueError."""
+        with pytest.raises(ValueError, match="unsupported robot_id prefix"):
+            send_task("MANI-001", "MV_SRC", {})
+
+
+# ===========================================================================
+# 2. AMR 좌표 매핑 — task_type → 정확한 좌표
+# ===========================================================================
+
+class TestAMRCoordinateMapping:
+    @pytest.mark.parametrize("task_type, expected", [
+        ("MV_SRC",      (0.90, 0.30, 0.00)),
+        ("MV_DEST",     (0.50, 1.00, 1.57)),
+        ("MV_SHIP",     (0.90, 1.70, 0.00)),
+        ("MV_CHG",      (0.10, 0.10, 0.00)),
+        ("RETURN_IDLE", (0.10, 0.10, 0.00)),
+    ])
+    def test_amr_coords_match_table(self, task_type, expected):
+        """각 task_type 이 _AMR_COORDS 테이블의 정확한 (x, y, theta) 로 매핑."""
+        result = send_task("AMR-001", task_type, {})
+        assert (result.x, result.y, result.theta) == expected
+
+    def test_amr_robot_id_does_not_affect_coords(self):
+        """AMR 은 robot_id 가 달라도 같은 task_type → 같은 좌표 (공통 목적지)."""
+        a = send_task("AMR-001", "MV_SRC", {})
+        b = send_task("AMR-002", "MV_SRC", {})
+        assert (a.x, a.y, a.theta) == (b.x, b.y, b.theta)
+
+    def test_amr_unknown_task_type_raises(self):
+        """등록되지 않은 AMR task_type 은 ValueError."""
+        with pytest.raises(ValueError, match="unknown AMR task_type"):
+            send_task("AMR-001", "FLY_TO_MOON", {})
+
+
+# ===========================================================================
+# 3. ARM 좌표 매핑 — robot_id 별로 좌표가 다름
+# ===========================================================================
+
+class TestArmCoordinateMapping:
+    def test_arm_002_mm_pose_differs_from_arm_001(self):
+        """같은 task_type(MM) 이어도 ARM-001 과 ARM-002 의 pose 는 달라야 한다."""
+        a = send_task("ARM-001", "MM", {})
+        b = send_task("ARM-002", "MM", {})
+        assert a != b, "두 팔의 설치 위치가 다르므로 pose 전체가 달라야 함"
+
+    @pytest.mark.parametrize("robot_id, task_type, expected", [
+        ("ARM-001", "MM",   ArmGoalPose(0.30, 0.00, 0.40, 0.00, 1.57, 0.00)),
+        ("ARM-001", "PP",   ArmGoalPose(0.40, 0.10, 0.30, 0.00, 1.57, 0.00)),
+        ("ARM-001", "INSP", ArmGoalPose(0.50, 0.00, 0.50, 0.00, 0.00, 0.00)),
+        ("ARM-001", "SHIP", ArmGoalPose(0.40, 0.20, 0.30, 0.00, 1.57, 0.00)),
+        ("ARM-002", "MM",   ArmGoalPose(0.32, 0.05, 0.40, 0.00, 1.57, 0.00)),
+        ("ARM-002", "PP",   ArmGoalPose(0.42, 0.15, 0.30, 0.00, 1.57, 0.00)),
+        ("ARM-002", "INSP", ArmGoalPose(0.52, 0.05, 0.50, 0.00, 0.00, 0.00)),
+        ("ARM-002", "SHIP", ArmGoalPose(0.42, 0.25, 0.30, 0.00, 1.57, 0.00)),
+    ])
+    def test_arm_pose_matches_table(self, robot_id, task_type, expected):
+        """모든 (robot_id, task_type) 조합이 테이블의 6DoF pose 와 일치."""
+        assert send_task(robot_id, task_type, {}) == expected
+
+    def test_arm_unknown_robot_id_raises(self):
+        """등록되지 않은 ARM robot_id 는 ValueError (어느 팔인지 모름)."""
+        with pytest.raises(ValueError, match="unknown ARM robot_id"):
+            send_task("ARM-999", "MM", {})
+
+    def test_arm_unknown_task_type_raises(self):
+        """등록된 robot_id 라도 그 팔이 모르는 task_type 은 ValueError."""
+        with pytest.raises(ValueError, match="unknown ARM task_type"):
+            send_task("ARM-001", "PICK_UP_THE_STAR", {})
+
+
+# ===========================================================================
+# 4. payload 동적 정보 — frame_id 오버라이드
+# ===========================================================================
+
+class TestPayloadDynamicInfo:
+    def test_amr_default_frame_id_is_map(self):
+        """AMR 의 frame_id 기본값은 'map'."""
+        result = send_task("AMR-001", "MV_SRC", {})
+        assert result.frame_id == "map"
+
+    def test_arm_default_frame_id_is_base_link(self):
+        """ARM 의 frame_id 기본값은 'base_link'."""
+        result = send_task("ARM-001", "MM", {})
+        assert result.frame_id == "base_link"
+
+    def test_amr_frame_id_overridden_by_payload(self):
+        """payload 의 frame_id 가 기본값을 덮어쓴다."""
+        result = send_task("AMR-001", "MV_SRC", {"frame_id": "odom"})
+        assert result.frame_id == "odom"
+
+    def test_arm_frame_id_overridden_by_payload(self):
+        """ARM 의 frame_id 도 동일하게 payload 로 오버라이드 가능."""
+        result = send_task("ARM-001", "MM", {"frame_id": "tool0"})
+        assert result.frame_id == "tool0"
+
+    def test_irrelevant_payload_keys_are_ignored(self):
+        """payload 의 다른 키는 좌표/frame 결정에 영향을 주지 않는다."""
+        result = send_task("AMR-001", "MV_SRC",
+                           {"item_id": 42, "extra": "noise"})
+        assert (result.x, result.y, result.theta) == (0.90, 0.30, 0.00)
+        assert result.frame_id == "map"
+
+
+# ===========================================================================
+# 5. 불변성 — 반환된 GoalPose 는 frozen dataclass
+# ===========================================================================
+
+class TestImmutability:
+    def test_amr_goal_pose_is_frozen(self):
+        """AMRGoalPose 는 생성 후 필드 변경 불가 (frozen=True)."""
+        result = send_task("AMR-001", "MV_SRC", {})
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.x = 999.0  # type: ignore[misc]
+
+    def test_arm_goal_pose_is_frozen(self):
+        """ArmGoalPose 도 frozen — 호출자가 좌표를 임의 변조하지 못한다."""
+        result = send_task("ARM-001", "MM", {})
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.z = 999.0  # type: ignore[misc]

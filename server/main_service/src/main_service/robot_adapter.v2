@@ -1,0 +1,111 @@
+"""adapter_v2 — send_task 구현
+
+조건:
+1. Input: robot_id, task_type, payload (모두 필수)
+2. Output: 실제 로봇을 움직일 수 있는 goal pose
+   - AMR (pinky)      → AmrGoalPoseInput (x, y, theta)
+   - MANI (jetcobot)  → ManiGoalPoseInput (x, y, z, roll, pitch, yaw)
+
+설계 원칙:
+- 행동(task_type) → 좌표 매핑은 *Adapter 안의 정적 테이블* 로 보유.
+  Robot Executor 는 task_type 만 던지면 됨 (좌표를 알 필요 없음).
+- 동적 정보(item_id, shelf_id 등)는 payload 로 받아 보정.
+"""
+from pydantic import BaseModel
+from typing import Any, Dict, Tuple, Union
+
+
+# ---------------------------------------------------------------------------
+# Goal Pose 타입
+# ---------------------------------------------------------------------------
+
+class AmrGoalPoseInput(BaseModel):
+    """2D AMR 이 이동할 목표 자세 (평면 + 회전)."""
+    x: float
+    y: float
+    theta: float  # yaw
+    frame_id: str = "map"
+
+    model_config = {"frozen": True}  # dataclass의 frozen=True와 동일
+
+class ManiGoalPoseInput(BaseModel):
+    """6DoF 로봇팔 엔드이펙터 목표 자세 (3D 위치 + 3D 자세)."""
+    x: float
+    y: float
+    z: float
+    roll: float
+    pitch: float
+    yaw: float
+    frame_id: str = "base_link"
+    
+    model_config = {"frozen": True}  # dataclass의 frozen=True와 동일
+
+
+GoalPose = Union[AmrGoalPoseInput, ManiGoalPoseInput]
+
+# ---------------------------------------------------------------------------
+# 좌표 테이블
+# - 공장 레이아웃이 바뀌면 이 테이블만 수정.
+# - 좌표값은 traffic_manager.py 의 WAYPOINTS 와 정합.
+# ---------------------------------------------------------------------------
+
+# AMR: task_type → (x, y, theta)
+_AMR_COORDS: Dict[str, Tuple[float, float, float]] = {
+    "MV_SRC":      (0.90, 0.30, 0.00),   # 적재 구역 (LOAD)
+    "MV_DEST":     (0.50, 1.00, 1.57),   # 후처리 구역 (POST)
+    "MV_SHIP":     (0.90, 1.70, 0.00),   # 출고 구역 (SHIP)
+    "MV_CHG":      (0.10, 0.10, 0.00),   # 충전소 (HOME)
+    "RETURN_IDLE": (0.10, 0.10, 0.00),   # 대기 위치 = 충전소
+}
+
+# MANI: robot_id → task_type → (x, y, z, roll, pitch, yaw)
+_MANI_POSES: Dict[str, Dict[str, Tuple[float, float, float, float, float, float]]] = {
+    "MANI-001": {
+        "MM":   (0.30, 0.00, 0.40, 0.00, 1.57, 0.00),
+        "PP":   (0.40, 0.10, 0.30, 0.00, 1.57, 0.00),
+        "INSP": (0.50, 0.00, 0.50, 0.00, 0.00, 0.00),
+        "SHIP": (0.40, 0.20, 0.30, 0.00, 1.57, 0.00),
+    },
+    "MANI-002": {
+        "MM":   (0.32, 0.05, 0.40, 0.00, 1.57, 0.00),
+        "PP":   (0.42, 0.15, 0.30, 0.00, 1.57, 0.00),
+        "INSP": (0.52, 0.05, 0.50, 0.00, 0.00, 0.00),
+        "SHIP": (0.42, 0.25, 0.30, 0.00, 1.57, 0.00),
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# send_task
+# ---------------------------------------------------------------------------
+
+def send_task(robot_id: str, task_type: str, payload: Dict[str, Any]) -> GoalPose:
+    """task_type 으로 좌표 테이블을 조회해 로봇 종류에 맞는 goal pose 를 만든다.
+
+    분기 기준: robot_id prefix
+      - "AMR-*" → _AMR_COORDS 조회 → AmrGoalPoseInput
+      - "MANI-*" → _MANI_POSES  조회 → ManiGoalPoseInput
+
+    payload 는 *동적 정보* (item_id 등) 전달용. 좌표는 사용하지 않음.
+    """
+    prefix = robot_id.split("-", 1)[0].upper()
+
+    if prefix == "AMR":
+        if task_type not in _AMR_COORDS:
+            raise ValueError(f"unknown AMR task_type: {task_type}")
+        x, y, theta = _AMR_COORDS[task_type]
+        # payload 로 frame_id 오버라이드 가능 (동적 정보 주입의 최소 예시).
+        return AmrGoalPoseInput(x=x, y=y, theta=theta,
+                           frame_id=payload.get("frame_id", "map"))
+
+    if prefix == "MANI":
+        MANI_table = _MANI_POSES.get(robot_id)
+        if MANI_table is None:
+            raise ValueError(f"unknown MANI robot_id: {robot_id}")
+        if task_type not in MANI_table:
+            raise ValueError(f"unknown MANI task_type for {robot_id}: {task_type}")
+        x, y, z, roll, pitch, yaw = MANI_table[task_type]
+        return ManiGoalPoseInput(x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw,
+                           frame_id=payload.get("frame_id", "base_link"))
+
+    raise ValueError(f"unsupported robot_id prefix: {robot_id}")

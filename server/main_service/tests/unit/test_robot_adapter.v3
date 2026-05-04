@@ -1,0 +1,139 @@
+"""adapter_v3 단위 테스트 — ROS2 없는 환경에서도 실행 가능 (mock 모드)."""
+
+from unittest.mock import MagicMock
+import sys
+import pytest
+from pydantic import ValidationError
+
+# ======================
+# 1️⃣ ROS2 메시지/액션 모듈 mock
+# ======================
+sys.modules['nav2_msgs'] = MagicMock()
+sys.modules['nav2_msgs.msg'] = MagicMock()
+sys.modules['nav2_msgs.action'] = MagicMock()
+sys.modules['smartcast_arm_msgs'] = MagicMock()
+sys.modules['smartcast_arm_msgs.msg'] = MagicMock()
+sys.modules['smartcast_arm_msgs.action'] = MagicMock()
+
+# mock 액션 타입도 만들어줌
+import main_service.robot_adapter_v3 as mod
+from main_service.robot_adapter_v3 import (
+    AmrGoalDockInput,
+    ManiGoalPoseInput,
+    convert_to_goal_pose,
+    send_to_ros,
+)
+
+mod.DockRobot = MagicMock()
+mod.MoveToPose = MagicMock()
+
+# ======================
+# 기존 테스트 그대로
+# ======================
+
+class TestTypeDispatch:
+    def test_amr_prefix_returns_amr_goal_pose(self):
+        result = convert_to_goal_pose("AMR-001", "ToCHG1", {})
+        assert isinstance(result, AmrGoalDockInput)
+
+    def test_mani_prefix_returns_mani_goal_pose(self):
+        result = convert_to_goal_pose("MANI-001", "MM", {})
+        assert isinstance(result, ManiGoalPoseInput)
+
+    def test_lowercase_prefix_is_normalized(self):
+        result = convert_to_goal_pose("amr-002", "ToCHG1", {})
+        assert isinstance(result, AmrGoalDockInput)
+
+    def test_unsupported_prefix_raises(self):
+        with pytest.raises(ValueError, match="unsupported robot_id prefix"):
+            convert_to_goal_pose("ARM-001", "ToCHG1", {})
+
+
+class TestAMRCoordinateMapping:
+    @pytest.mark.parametrize("task_type, expected", [
+        ("ToINSP",  AmrGoalDockInput(dock_id="ToINSP",  x=-0.670, y=-0.100, theta=-1.57, dock_type="test_dock")),
+        ("ToSHIP",  AmrGoalDockInput(dock_id="ToSHIP",  x=-0.670, y= 0.450, theta= 1.57, dock_type="test_dock")),
+        ("ToCAST1", AmrGoalDockInput(dock_id="ToCAST1", x=-0.256, y= 0.200, theta= 1.57, dock_type="test_dock")),
+        ("ToCAST2", AmrGoalDockInput(dock_id="ToCAST2", x=-0.413, y= 0.200, theta= 1.57, dock_type="test_dock")),
+        ("ToCHG1",  AmrGoalDockInput(dock_id="ToCHG1",  x= 0.044, y= 0.095, theta= 0.00, dock_type="test_dock")),
+        ("ToCHG2",  AmrGoalDockInput(dock_id="ToCHG2",  x= 0.044, y=-0.027, theta= 0.00, dock_type="test_dock")),
+        ("ToCHG3",  AmrGoalDockInput(dock_id="ToCHG3",  x= 0.044, y=-0.179, theta= 0.00, dock_type="test_dock")),
+        ("ToSTRG1", AmrGoalDockInput(dock_id="ToSTRG1", x=-0.100, y=-0.465, theta=-1.57, dock_type="STRG_dock")),
+        ("ToSTRG2", AmrGoalDockInput(dock_id="ToSTRG2", x=-0.223, y=-0.465, theta=-1.57, dock_type="test_dock")),
+        ("ToPP1",   AmrGoalDockInput(dock_id="ToPP1",   x=-0.447, y=-1.050, theta= 3.14, dock_type="test_dock")),
+        ("ToPP2",   AmrGoalDockInput(dock_id="ToPP2",   x=-0.447, y=-1.130, theta= 3.14, dock_type="test_dock")),
+    ])
+    def test_amr_coords_match_table(self, task_type, expected):
+        assert convert_to_goal_pose("AMR-001", task_type, {}) == expected
+
+    def test_amr_robot_id_does_not_affect_coords(self):
+        a = convert_to_goal_pose("AMR-001", "ToCHG1", {})
+        b = convert_to_goal_pose("AMR-002", "ToCHG1", {})
+        assert (a.x, a.y, a.theta) == (b.x, b.y, b.theta)
+
+    def test_amr_unknown_task_type_raises(self):
+        with pytest.raises(ValueError, match="unknown AMR task_type"):
+            convert_to_goal_pose("AMR-001", "FLY_TO_MOON", {})
+
+
+class TestManiCoordinateMapping:
+    def test_mani_002_mm_pose_differs_from_mani_001(self):
+        a = convert_to_goal_pose("MANI-001", "MM", {})
+        b = convert_to_goal_pose("MANI-002", "MM", {})
+        assert a != b
+
+    @pytest.mark.parametrize("robot_id, task_type, expected", [
+        ("MANI-001", "MM",   ManiGoalPoseInput(x=0.30, y=0.00, z=0.40, roll=0.00, pitch=1.57, yaw=0.00)),
+        ("MANI-001", "PP",   ManiGoalPoseInput(x=0.40, y=0.10, z=0.30, roll=0.00, pitch=1.57, yaw=0.00)),
+        ("MANI-001", "INSP", ManiGoalPoseInput(x=0.50, y=0.00, z=0.50, roll=0.00, pitch=0.00, yaw=0.00)),
+        ("MANI-001", "SHIP", ManiGoalPoseInput(x=0.40, y=0.20, z=0.30, roll=0.00, pitch=1.57, yaw=0.00)),
+        ("MANI-002", "MM",   ManiGoalPoseInput(x=0.32, y=0.05, z=0.40, roll=0.00, pitch=1.57, yaw=0.00)),
+        ("MANI-002", "PP",   ManiGoalPoseInput(x=0.42, y=0.15, z=0.30, roll=0.00, pitch=1.57, yaw=0.00)),
+        ("MANI-002", "INSP", ManiGoalPoseInput(x=0.52, y=0.05, z=0.50, roll=0.00, pitch=0.00, yaw=0.00)),
+        ("MANI-002", "SHIP", ManiGoalPoseInput(x=0.42, y=0.25, z=0.30, roll=0.00, pitch=1.57, yaw=0.00)),
+    ])
+    def test_mani_pose_matches_table(self, robot_id, task_type, expected):
+        assert convert_to_goal_pose(robot_id, task_type, {}) == expected
+
+    def test_mani_unknown_robot_id_raises(self):
+        with pytest.raises(ValueError, match="unknown MANI robot_id"):
+            convert_to_goal_pose("MANI-999", "MM", {})
+
+    def test_mani_unknown_task_type_raises(self):
+        with pytest.raises(ValueError, match="unknown MANI task_type"):
+            convert_to_goal_pose("MANI-001", "PICK_UP_THE_STAR", {})
+
+
+class TestImmutability:
+    def test_amr_goal_pose_is_frozen(self):
+        result = convert_to_goal_pose("AMR-001", "ToCHG1", {})
+        with pytest.raises(ValidationError):
+            result.x = 999.0  # type: ignore[misc]
+
+    def test_mani_goal_pose_is_frozen(self):
+        result = convert_to_goal_pose("MANI-001", "MM", {})
+        with pytest.raises(ValidationError):
+            result.z = 999.0  # type: ignore[misc]
+
+
+# ======================
+# 5️⃣ send_to_ros — ROS2 Action 모두 mock 처리
+# ======================
+@pytest.fixture
+def fake_ros(monkeypatch):
+    from action_msgs.msg import GoalStatus
+
+    wrapped = MagicMock()
+    wrapped.status = GoalStatus.STATUS_SUCCEEDED
+    wrapped.result.success = True
+    wrapped.result.error_code = 0
+    wrapped.result.num_retries = 0
+    wrapped.result.message = "ok"
+
+    result_future = MagicMock()
+    result_future.done.return_value = True
+    result_future.result.return_value = wrapped
+
+    goal_handle = MagicMock()
+    goal_handle.accepted = True
+    goal_handle.get

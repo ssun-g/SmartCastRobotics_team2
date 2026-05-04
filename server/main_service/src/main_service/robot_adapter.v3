@@ -1,0 +1,265 @@
+"""adapter_v3 — send_to_ros 구현
+
+조건:
+1. Input: robot_id, task_type, payload (모두 필수)
+2. Output: 실제 로봇을 움직일 수 있는 goal pose
+   - AMR (pinky)      → AmrGoalDockInput (opennav_docking 도크 좌표 + dock_type)
+   - MANI (jetcobot)  → ManiGoalPoseInput (x, y, z, roll, pitch, yaw)
+
+설계 원칙:
+- 행동(task_type) → 좌표 매핑은 *Adapter 안의 정적 테이블* 로 보유.
+  Robot Executor 는 task_type 만 던지면 됨 (좌표를 알 필요 없음).
+- 동적 정보(item_id, shelf_id 등)는 payload 로 받아 보정.
+- AMR 은 정밀 정렬을 위해 NavigateToPose 가 아닌 opennav_docking DockRobot
+  action 을 사용. task_type 은 ToINSP / ToCAST1 등 dock station id.
+- MANI 는 custom smartcast_arm_msgs/action/MoveToPose 사용.
+  task_type 은 MM / PP / INSP / SHIP 등 6DoF pose 식별자.
+"""
+import math
+from typing import Any, Dict, Literal, Tuple, Union
+
+import rclpy
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped
+from nav2_msgs.action import DockRobot
+from pydantic import BaseModel
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from smartcast_arm_msgs.action import MoveToPose  # custom action
+from smartcast_arm_msgs.action import MoveToPose  # custom action
+
+
+# ---------------------------------------------------------------------------
+# Goal Pose 타입
+# ---------------------------------------------------------------------------
+
+class AmrGoalDockInput(BaseModel):
+    """opennav_docking 스테이션 1개 (map frame)."""
+    dock_id: str
+    x: float
+    y: float
+    theta: float                                       # rad
+    dock_type: Literal["test_dock", "STRG_dock"]       # docking_server YAML 등록 plugin id
+
+    model_config = {"frozen": True}
+
+
+class ManiGoalPoseInput(BaseModel):
+    """6DoF 로봇팔 엔드이펙터 목표 자세 (3D 위치 + 3D 자세)."""
+    x: float
+    y: float
+    z: float
+    roll: float
+    pitch: float
+    yaw: float
+    frame_id: str = "base_link"
+
+    model_config = {"frozen": True}  # dataclass의 frozen=True와 동일
+
+
+GoalPose = Union[AmrGoalDockInput, ManiGoalPoseInput]
+
+# ---------------------------------------------------------------------------
+# 좌표 테이블
+# - 공장 레이아웃이 바뀌면 이 테이블만 수정.
+# - 좌표값은 실제 맵에서 측정한 값 (map frame).
+# ---------------------------------------------------------------------------
+
+# AMR: task_type(=dock station id) → AmrGoalDockInput
+DOCK_STATIONS: Dict[str, AmrGoalDockInput] = {
+    "ToINSP":  AmrGoalDockInput(dock_id="ToINSP",  x=-0.670, y=-0.100, theta=-1.57, dock_type="test_dock"),
+    "ToSHIP":  AmrGoalDockInput(dock_id="ToSHIP",  x=-0.670, y= 0.450, theta= 1.57, dock_type="test_dock"),
+    "ToCAST1": AmrGoalDockInput(dock_id="ToCAST1", x=-0.256, y= 0.200, theta= 1.57, dock_type="test_dock"),
+    "ToCAST2": AmrGoalDockInput(dock_id="ToCAST2", x=-0.413, y= 0.200, theta= 1.57, dock_type="test_dock"),
+    "ToCHG1":  AmrGoalDockInput(dock_id="ToCHG1",  x= 0.044, y= 0.095, theta= 0.00, dock_type="test_dock"),
+    "ToCHG2":  AmrGoalDockInput(dock_id="ToCHG2",  x= 0.044, y=-0.027, theta= 0.00, dock_type="test_dock"),
+    "ToCHG3":  AmrGoalDockInput(dock_id="ToCHG3",  x= 0.044, y=-0.179, theta= 0.00, dock_type="test_dock"),
+    "ToSTRG1": AmrGoalDockInput(dock_id="ToSTRG1", x=-0.100, y=-0.465, theta=-1.57, dock_type="STRG_dock"),
+    "ToSTRG2": AmrGoalDockInput(dock_id="ToSTRG2", x=-0.223, y=-0.465, theta=-1.57, dock_type="test_dock"),
+    "ToPP1":   AmrGoalDockInput(dock_id="ToPP1",   x=-0.447, y=-1.050, theta= 3.14, dock_type="test_dock"),
+    "ToPP2":   AmrGoalDockInput(dock_id="ToPP2",   x=-0.447, y=-1.130, theta= 3.14, dock_type="test_dock"),
+}
+
+# MANI: robot_id → task_type → (x, y, z, roll, pitch, yaw)
+_MANI_POSES: Dict[str, Dict[str, Tuple[float, float, float, float, float, float]]] = {
+    "MANI-001": {
+        "MM":   (0.30, 0.00, 0.40, 0.00, 1.57, 0.00),
+        "PP":   (0.40, 0.10, 0.30, 0.00, 1.57, 0.00),
+        "INSP": (0.50, 0.00, 0.50, 0.00, 0.00, 0.00),
+        "SHIP": (0.40, 0.20, 0.30, 0.00, 1.57, 0.00),
+    },
+    "MANI-002": {
+        "MM":   (0.32, 0.05, 0.40, 0.00, 1.57, 0.00),
+        "PP":   (0.42, 0.15, 0.30, 0.00, 1.57, 0.00),
+        "INSP": (0.52, 0.05, 0.50, 0.00, 0.00, 0.00),
+        "SHIP": (0.42, 0.25, 0.30, 0.00, 1.57, 0.00),
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# convert_to_goal_pose
+# ---------------------------------------------------------------------------
+
+def convert_to_goal_pose(robot_id: str, task_type: str, payload: Dict[str, Any]) -> GoalPose:
+    """task_type 으로 좌표 테이블을 조회해 로봇 종류에 맞는 goal pose 를 만든다.
+
+    분기 기준: robot_id prefix
+      - "AMR-*"  → DOCK_STATIONS 조회 → AmrGoalDockInput
+      - "MANI-*" → _MANI_POSES   조회 → ManiGoalPoseInput
+
+    payload 는 *동적 정보* (item_id 등) 전달용. 좌표는 사용하지 않음.
+    """
+    prefix = robot_id.split("-", 1)[0].upper()
+
+    if prefix == "AMR":
+        if task_type not in DOCK_STATIONS:
+            raise ValueError(f"unknown AMR task_type (dock station): {task_type}")
+        return DOCK_STATIONS[task_type]
+
+    if prefix == "MANI":
+        MANI_table = _MANI_POSES.get(robot_id)
+        if MANI_table is None:
+            raise ValueError(f"unknown MANI robot_id: {robot_id}")
+        if task_type not in MANI_table:
+            raise ValueError(f"unknown MANI task_type for {robot_id}: {task_type}")
+        x, y, z, roll, pitch, yaw = MANI_table[task_type]
+        return ManiGoalPoseInput(x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw,
+                           frame_id=payload.get("frame_id", "base_link"))
+
+    raise ValueError(f"unsupported robot_id prefix: {robot_id}")
+
+
+# ---------------------------------------------------------------------------
+# send_to_ros — DOCK_STATIONS 조회 후 ROS2 action server 로 전달
+# ---------------------------------------------------------------------------
+
+def send_to_ros(robot_id: str, task_type: str, timeout_sec: float = 60.0) -> Tuple[bool, str]:
+    """task_type 으로 좌표 테이블 조회 → 로봇 종류별 ROS2 action 호출.
+    도착/실패까지 블로킹 대기 후 결과 반환.
+
+    매핑:
+      - AMR  → nav2_msgs/action/DockRobot,           /{robot_id}/dock_robot
+               (by-pose mode: use_dock_id=False, dock_pose + dock_type 직접 전달)
+      - MANI → smartcast_arm_msgs/action/MoveToPose, /{robot_id}/move_to_pose
+               (Goal: PoseStamped pose / Result: bool success, string message)
+
+    반환 (succeeded, message):
+      - succeeded=True  : action 성공 (result.success=True)
+      - succeeded=False : 서버 미가용/거부/타임아웃/abort/실행 실패. message 에 사유
+
+    ROS2 (rclpy + nav2_msgs + smartcast_arm_msgs) 가 설치되어 있어야 동작.
+    """
+    prefix = robot_id.split("-", 1)[0].upper()
+    if prefix not in ("AMR", "MANI"):
+        raise ValueError(f"unsupported robot_id prefix: {robot_id}")
+
+    # 입력 검증 — rclpy 노드 생성 전에 cheap fail
+    if prefix == "AMR":
+        if task_type not in DOCK_STATIONS:
+            return False, f"unknown task_type: {task_type}"
+    else:  # MANI
+        mani_table = _MANI_POSES.get(robot_id)
+        if mani_table is None:
+            return False, f"unknown MANI robot_id: {robot_id}"
+        if task_type not in mani_table:
+            return False, f"unknown MANI task_type for {robot_id}: {task_type}"
+
+    if not rclpy.ok():
+        rclpy.init(args=None)
+    node = Node("main_service_send_to_ros")
+    try:
+        if prefix == "AMR":
+            station = DOCK_STATIONS[task_type]
+            client = ActionClient(node, DockRobot, f"/{robot_id}/dock_robot")
+            if not client.wait_for_server(timeout_sec=5.0):
+                return False, f"dock action server unavailable: {robot_id}"
+
+            # by-pose mode 용 PoseStamped 빌드 (yaw → quaternion, roll=pitch=0)
+            ps = PoseStamped()
+            ps.header.stamp = node.get_clock().now().to_msg()
+            ps.header.frame_id = "map"
+            ps.pose.position.x = station.x
+            ps.pose.position.y = station.y
+            ps.pose.position.z = 0.0
+            ps.pose.orientation.z = math.sin(station.theta * 0.5)
+            ps.pose.orientation.w = math.cos(station.theta * 0.5)
+
+            goal = DockRobot.Goal()
+            goal.use_dock_id = False              # by-pose mode
+            goal.dock_pose = ps
+            goal.dock_type = station.dock_type
+            goal.navigate_to_staging_pose = True  # 도크 접근 단계 자동 수행
+
+            send_future = client.send_goal_async(goal)
+            rclpy.spin_until_future_complete(node, send_future, timeout_sec=5.0)
+            if not send_future.done():
+                return False, "send_goal timeout"
+
+            handle = send_future.result()
+            if not handle.accepted:
+                return False, "goal rejected by dock action server"
+
+            result_future = handle.get_result_async()
+            rclpy.spin_until_future_complete(node, result_future, timeout_sec=timeout_sec)
+            if not result_future.done():
+                handle.cancel_goal_async()
+                return False, f"result timeout after {timeout_sec}s (cancel requested)"
+
+            wrapped = result_future.result()
+            status = wrapped.status
+            if status != GoalStatus.STATUS_SUCCEEDED:
+                return False, f"action failed (status={status})"
+            if not wrapped.result.success:
+                return False, f"dock failed (error_code={wrapped.result.error_code}, retries={wrapped.result.num_retries})"
+            return True, "docked"
+
+        # MANI: smartcast_arm_msgs/action/MoveToPose
+        x, y, z, roll, pitch, yaw = _MANI_POSES[robot_id][task_type]
+        client = ActionClient(node, MoveToPose, f"/{robot_id}/move_to_pose")
+        if not client.wait_for_server(timeout_sec=5.0):
+            return False, f"move_to_pose action server unavailable: {robot_id}"
+
+        # full RPY → quaternion (ZYX intrinsic, 6DoF 라 roll/pitch 도 포함)
+        cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+        cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+        cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+
+        ps = PoseStamped()
+        ps.header.stamp = node.get_clock().now().to_msg()
+        ps.header.frame_id = "base_link"
+        ps.pose.position.x = x
+        ps.pose.position.y = y
+        ps.pose.position.z = z
+        ps.pose.orientation.x = sr * cp * cy - cr * sp * sy
+        ps.pose.orientation.y = cr * sp * cy + sr * cp * sy
+        ps.pose.orientation.z = cr * cp * sy - sr * sp * cy
+        ps.pose.orientation.w = cr * cp * cy + sr * sp * sy
+
+        goal = MoveToPose.Goal()
+        goal.pose = ps
+
+        send_future = client.send_goal_async(goal)
+        rclpy.spin_until_future_complete(node, send_future, timeout_sec=5.0)
+        if not send_future.done():
+            return False, "send_goal timeout"
+
+        handle = send_future.result()
+        if not handle.accepted:
+            return False, "goal rejected by move_to_pose action server"
+
+        result_future = handle.get_result_async()
+        rclpy.spin_until_future_complete(node, result_future, timeout_sec=timeout_sec)
+        if not result_future.done():
+            handle.cancel_goal_async()
+            return False, f"result timeout after {timeout_sec}s (cancel requested)"
+
+        wrapped = result_future.result()
+        status = wrapped.status
+        if status != GoalStatus.STATUS_SUCCEEDED:
+            return False, f"action failed (status={status})"
+        if not wrapped.result.success:
+            return False, f"mani move failed: {wrapped.result.message}"
+        return True, "moved"
+    finally:
+        node.destroy_node()
